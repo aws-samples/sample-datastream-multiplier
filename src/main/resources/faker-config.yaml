@@ -1,0 +1,29 @@
+# ============================================================================
+# NYC Trip Generation Configuration - With Location Names
+# ============================================================================
+
+trip_generation:
+  # From Location Name (NYC neighborhoods and landmarks)
+  from_location_name:
+    expression: "#{options.option 'Manhattan - Times Square','Manhattan - Central Park','Manhattan - Financial District','Brooklyn - Williamsburg','Brooklyn - Park Slope','Queens - Astoria','Queens - Flushing','Bronx - Yankee Stadium','Staten Island - St. George','JFK Airport','LaGuardia Airport','Newark Airport','Upper East Side','Upper West Side','Chelsea','Greenwich Village','SoHo','Tribeca','East Village','Harlem'}"
+    expressionType: "string"
+
+  # To Location Name (NYC neighborhoods and landmarks)
+  to_location_name:
+    expression: "#{options.option 'Manhattan - Times Square','Manhattan - Central Park','Manhattan - Financial District','Brooklyn - Williamsburg','Brooklyn - Park Slope','Queens - Astoria','Queens - Flushing','Bronx - Yankee Stadium','Staten Island - St. George','JFK Airport','LaGuardia Airport','Newark Airport','Upper East Side','Upper West Side','Chelsea','Greenwich Village','SoHo','Tribeca','East Village','Harlem'}"
+    expressionType: "string"
+
+  # Trip Distance in miles (0.5 to 20.0)
+  distance:
+    expression: "#{number.randomDouble '2','0','20'}"
+    expressionType: "float"
+
+  # Total Amount ($5 to $150)
+  amount:
+    expression: "#{number.randomDouble '2','5','150'}"
+    expressionType: "float"
+
+  # Category (1=Standard, 2=Premium, 3=Luxury)
+  category:
+    expression: "#{options.option '1','2','3'}"
+    expressionType: "string"

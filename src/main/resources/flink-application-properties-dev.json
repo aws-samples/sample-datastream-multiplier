@@ -1,0 +1,37 @@
+[
+  {
+    "PropertyGroupId": "multipliedStream",
+    "PropertyMap": {
+      "source.type": "kinesis",
+      "multiple.factor": "1",
+      "key.fields": "tripId",
+      "random.seeds": "1000,2000,3000,4000,5000",
+      "updatable.fields": "fromLocationName,toLocationName,distance,amount,category",
+      "rate.limit.per.second": "1000"
+    }
+  },
+  {
+    "PropertyGroupId": "InputStream0",
+    "PropertyMap": {
+      "aws.region": "us-west-2",
+      "stream.name": "sample_replay_input_stream",
+      "stream.arn": "arn:aws:kinesis:us-west-2:123456789012:stream/sample_replay_input_stream"
+    }
+  },
+  {
+    "PropertyGroupId": "OutputStream0",
+    "PropertyMap": {
+      "aws.region": "us-west-2",
+      "stream.name": "sample_replay_output_stream",
+      "stream.arn": "arn:aws:kinesis:us-west-2:123456789012:stream/sample_replay_output_stream"
+    }
+  },
+  {
+    "PropertyGroupId": "OutputStream1",
+    "PropertyMap": {
+      "aws.region": "us-west-2",
+      "stream.name": "sample_replay_output_stream",
+      "stream.arn": "arn:aws:kinesis:us-west-2:123456789012:stream/sample_replay_output_stream"
+    }
+  }
+]

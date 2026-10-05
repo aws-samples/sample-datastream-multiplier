@@ -1,0 +1,542 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Data Stream Multiplier - Deploys an Amazon Managed Service for Apache Flink
+  application that reads from an input Kinesis Data Stream, multiplies each
+  record by a configurable factor (with optional field randomization), and
+  writes the amplified records to an output Kinesis Data Stream.
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: DataStreamMultiplier
+    Description: Name of the Managed Service for Apache Flink application.
+
+  S3BucketArn:
+    Type: String
+    Description: ARN of the S3 bucket containing the application JAR (e.g., arn:aws:s3:::my-bucket).
+
+  S3Key:
+    Type: String
+    Default: DataStreamGeneratorDemo-flink_2.3.jar
+    Description: S3 key (path) to the application uber JAR file produced by `sbt assembly`.
+
+  CreateInputStream:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Whether to create the input Kinesis Data Stream. Set to 'false' to reuse an
+      existing stream with the name given in InputStreamName.
+
+  InputStreamName:
+    Type: String
+    Default: sample_replay_input_stream
+    Description: >
+      Name of the input Kinesis Data Stream (source). When CreateInputStream is 'true'
+      a stream with this name is created; when 'false' this names an existing stream
+      (in this account/region) to read from.
+
+  OutputStreamName:
+    Type: String
+    Default: sample_replay_output_stream
+    Description: Name of the output Kinesis Data Stream to create (multiplied sink).
+
+  SourceType:
+    Type: String
+    Default: kinesis
+    AllowedValues:
+      - kinesis
+      - datagen
+    Description: >-
+      Source mode for the application. 'kinesis' replays a pre-recorded data stream
+      (amplification mode). 'datagen' generates records in the application at
+      RateLimitPerSec, requiring no input stream (pure synthetic mode).
+
+  StreamRetentionHours:
+    Type: Number
+    Default: 168
+    MinValue: 24
+    MaxValue: 8760
+    Description: >-
+      Retention period in hours for both Kinesis Data Streams. 24 is the default
+      tier. Values from 25 to 168 (7 days) use extended retention, billed per
+      shard-hour. Values above 168 use long-term retention, billed per GB-month.
+
+  InputShardCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Number of shards for the input Kinesis Data Stream.
+
+  ProducerNumRecords:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: >
+      Number of records the sample producer Lambda emits per invocation.
+      Only used when CreateInputStream is 'true'.
+
+  OutputShardCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Number of shards for the output Kinesis Data Stream (typically higher than input to absorb the multiplier).
+
+  FlinkRuntimeEnvironment:
+    Type: String
+    Default: FLINK-2_3
+    AllowedValues:
+      - FLINK-2_3
+    Description: Apache Flink runtime version. This project targets Flink 2.3.
+
+  MultipleFactor:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: Number of copies to emit per input record (1-100). 1 = passthrough.
+
+  KeyFields:
+    Type: String
+    Default: tripId
+    Description: Comma-separated fields used when computing the per-copy randomization hash.
+
+  RandomSeeds:
+    Type: String
+    Default: '1000,2000,3000,4000,5000'
+    Description: >
+      Comma-separated random seeds used to derive deterministic randomization per copy.
+      Provide at least (MultipleFactor - 1) seeds for fully distinct copies.
+
+  UpdatableFields:
+    Type: String
+    Default: 'fromLocationName,toLocationName,distance,amount,category'
+    Description: Comma-separated NYCTrip fields to randomize on each multiplied copy.
+
+  RateLimitPerSec:
+    Type: Number
+    Default: 1000
+    Description: Records-per-second rate limit (used by the optional DataGen source path).
+
+  LogGroupKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: (Optional) ARN of the KMS key for CloudWatch Logs encryption. If empty, a KMS key will be created.
+
+Resources:
+  # -------------------------------------------------------
+  # IAM Access Analyzer
+  # -------------------------------------------------------
+  AccessAnalyzer:
+    Type: AWS::AccessAnalyzer::Analyzer
+    Properties:
+      AnalyzerName: !Sub '${ApplicationName}-analyzer'
+      Type: ACCOUNT
+
+  # -------------------------------------------------------
+  # Kinesis Data Stream (input / source)
+  # -------------------------------------------------------
+  InputKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Condition: CreateInputStream
+    Properties:
+      Name: !Ref InputStreamName
+      ShardCount: !Ref InputShardCount
+      RetentionPeriodHours: !Ref StreamRetentionHours
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+
+  # -------------------------------------------------------
+  # Sample producer Lambda (writes NYCTrip records to the input stream).
+  # Only created when this stack owns the input stream (CreateInputStream=true).
+  # -------------------------------------------------------
+  ProducerLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateInputStream
+    Properties:
+      RoleName: !Sub '${ApplicationName}-producer-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ApplicationName}-producer-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Write access to the input stream only
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:ListShards
+                Resource: !Sub 'arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${InputStreamName}'
+              # CloudWatch Logs for the Lambda
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationName}-producer:*'
+              # X-Ray tracing. Neither action supports resource-level permissions,
+              # so the resource cannot be scoped further.
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+
+  ProducerLambda:
+    Type: AWS::Lambda::Function
+    Condition: CreateInputStream
+    # No DeadLetterConfig by design. This helper Lambda is invoked synchronously,
+    # on demand, to seed the input stream with a small batch of sample records. It
+    # is not part of the multiplier data path and has no asynchronous invoker, so a
+    # dead letter queue would never receive anything. Failures surface in the
+    # caller's response and in the function's CloudWatch logs.
+    # kics-scan ignore-block
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-producer'
+      Description: Emits sample NYCTrip records into the input Kinesis stream.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt ProducerLambdaRole.Arn
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Component
+          Value: sample-data-producer
+      Environment:
+        Variables:
+          STREAM_NAME: !Ref InputStreamName
+          NUM_RECORDS: !Ref ProducerNumRecords
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import random
+          import time
+
+          import boto3
+
+          kinesis = boto3.client("kinesis")
+
+          STREAM_NAME = os.environ.get("STREAM_NAME", "sample_replay_input_stream")
+          NUM_RECORDS = int(os.environ.get("NUM_RECORDS", "10"))
+
+          FROM_LOCATIONS = ["Manhattan", "Brooklyn", "Queens", "Bronx", "StatenIsland"]
+          TO_LOCATIONS = ["JFK", "LaGuardia", "Newark", "TimesSquare", "CentralPark"]
+          CATEGORIES = ["standard", "premium", "shared", "xl"]
+
+          # random is the Mersenne Twister PRNG, which is not cryptographically secure.
+          # That is intentional and appropriate here: this function produces sample trip
+          # records to seed a test stream. No secret, key or token is generated, and a
+          # seedable generator is what makes synthetic data reproducible.
+
+
+          def build_trip_record(trip_id: int) -> dict:
+              """
+              Produce a record matching the JSON shape that JsonDeserializationSchema reads:
+                {"tripId": .., "timestamp": .., "fromLocationName": .., "toLocationName": ..,
+                 "distance": .., "amount": .., "category": ..}
+              Values stay inside the bounds the deserializer validates.
+              """
+              return {
+                  "tripId": trip_id,
+                  "timestamp": int(time.time() * 1000),
+                  "fromLocationName": random.choice(FROM_LOCATIONS),
+                  "toLocationName": random.choice(TO_LOCATIONS),
+                  "distance": round(random.uniform(0.5, 40.0), 2),   # 0 <= distance <= 10000
+                  "amount": round(random.uniform(5.0, 250.0), 2),    # 0 <= amount <= 100000
+                  "category": random.choice(CATEGORIES),
+              }
+
+
+          def lambda_handler(event, context):
+              records = []
+              for i in range(NUM_RECORDS):
+                  payload = json.dumps(build_trip_record(trip_id=i))
+                  records.append(
+                      {
+                          "Data": payload.encode("utf-8"),
+                          # Partition key spreads records across shards; any stable value works.
+                          "PartitionKey": str(i),
+                      }
+                  )
+
+              response = kinesis.put_records(StreamName=STREAM_NAME, Records=records)
+
+              failed = response.get("FailedRecordCount", 0)
+              result = {
+                  "stream": STREAM_NAME,
+                  "requested": NUM_RECORDS,
+                  "failed": failed,
+                  "sample": records[0]["Data"].decode("utf-8"),
+              }
+              print(json.dumps(result))
+              return result
+  # -------------------------------------------------------
+  # Kinesis Data Stream (output / multiplied sink)
+  # -------------------------------------------------------
+  OutputKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Ref OutputStreamName
+      ShardCount: !Ref OutputShardCount
+      RetentionPeriodHours: !Ref StreamRetentionHours
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+
+  # -------------------------------------------------------
+  # IAM Role for Managed Flink Application
+  # -------------------------------------------------------
+  FlinkApplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kinesisanalytics.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref FlinkApplicationPolicy
+
+  # -------------------------------------------------------
+  # IAM Managed Policy for Managed Flink Application
+  # -------------------------------------------------------
+  FlinkApplicationPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W13
+            reason: "cloudwatch:PutMetricData does not support resource-level ARNs; scoped via namespace condition"
+    # KICS 022f8938 ("IAM policy allows for data exfiltration") flags any Allow
+    # statement whose action list contains s3:GetObject. It does not inspect the
+    # Resource or Condition, so the finding cannot be remediated by scoping: the
+    # application role must read its JAR from S3 for Managed Service for Apache
+    # Flink to load the code. The grant below is limited to the single object
+    # ${S3BucketArn}/${S3Key} and conditioned on s3:ResourceAccount matching this
+    # account, so it is not an unrestricted read.
+    #
+    # The blank line below is required. KICS only honours the ignore marker when it
+    # is not part of a contiguous comment block, so do not remove the separator.
+
+    # kics-scan ignore-block
+    Properties:
+      ManagedPolicyName: !Sub '${ApplicationName}-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # S3 read access for the application JAR only, scoped to a single object
+          # and conditioned to this account. See the KICS note on the resource above.
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub '${S3BucketArn}/${S3Key}'
+            Condition:
+              StringEquals:
+                s3:ResourceAccount: !Ref 'AWS::AccountId'
+          # Kinesis read access (input stream / KinesisStreamsSource - FLIP-27)
+          # Resolves to the created stream, or the provided existing stream ARN.
+          - Effect: Allow
+            Action:
+              - kinesis:DescribeStream
+              - kinesis:DescribeStreamSummary
+              - kinesis:GetShardIterator
+              - kinesis:GetRecords
+              - kinesis:ListShards
+            Resource: !Sub 'arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${InputStreamName}'
+          # Kinesis write access (output stream / KinesisStreamsSink)
+          - Effect: Allow
+            Action:
+              - kinesis:PutRecord
+              - kinesis:PutRecords
+              - kinesis:DescribeStream
+              - kinesis:DescribeStreamSummary
+              - kinesis:ListShards
+            Resource: !GetAtt OutputKinesisStream.Arn
+          # CloudWatch Logs
+          - Effect: Allow
+            Action:
+              - logs:PutLogEvents
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesis-analytics/${ApplicationName}:*'
+          # CloudWatch Metrics
+          - Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+            Resource: '*'
+            Condition:
+              StringEquals:
+                cloudwatch:namespace: 'AWS/KinesisAnalytics'
+
+  # -------------------------------------------------------
+  # KMS Key for CloudWatch Logs encryption
+  # -------------------------------------------------------
+  LogGroupKmsKey:
+    Type: AWS::KMS::Key
+    Condition: CreateLogGroupKmsKey
+    Properties:
+      Description: !Sub 'KMS key for ${ApplicationName} CloudWatch Logs encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowKeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesis-analytics/${ApplicationName}'
+
+  # -------------------------------------------------------
+  # CloudWatch Log Group
+  # -------------------------------------------------------
+  FlinkLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesis-analytics/${ApplicationName}'
+      RetentionInDays: 7
+      KmsKeyId: !If
+        - CreateLogGroupKmsKey
+        - !GetAtt LogGroupKmsKey.Arn
+        - !Ref LogGroupKmsKeyArn
+
+  FlinkLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FlinkLogGroup
+      LogStreamName: flink-application
+
+  # -------------------------------------------------------
+  # Managed Apache Flink Application
+  # -------------------------------------------------------
+  FlinkApplication:
+    Type: AWS::KinesisAnalyticsV2::Application
+    Properties:
+      ApplicationName: !Ref ApplicationName
+      RuntimeEnvironment: !Ref FlinkRuntimeEnvironment
+      ServiceExecutionRole: !GetAtt FlinkApplicationRole.Arn
+      ApplicationConfiguration:
+        ApplicationCodeConfiguration:
+          CodeContent:
+            S3ContentLocation:
+              BucketARN: !Ref S3BucketArn
+              FileKey: !Ref S3Key
+          CodeContentType: ZIPFILE
+        EnvironmentProperties:
+          PropertyGroups:
+            # Multiplier configuration - read by DataMultiplierJob / StreamMultiplier
+            - PropertyGroupId: multipliedStream
+              PropertyMap:
+                multiple.factor: !Ref MultipleFactor
+                key.fields: !Ref KeyFields
+                random.seeds: !Ref RandomSeeds
+                updatable.fields: !Ref UpdatableFields
+                rate.limit.per.second: !Ref RateLimitPerSec
+                source.type: !Ref SourceType
+            # Input Kinesis stream - read by createSource
+            - PropertyGroupId: InputStream0
+              PropertyMap:
+                stream.arn: !Sub 'arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${InputStreamName}'
+                aws.region: !Ref 'AWS::Region'
+            # Output Kinesis stream - read by createSink
+            - PropertyGroupId: OutputStream0
+              PropertyMap:
+                stream.arn: !GetAtt OutputKinesisStream.Arn
+                aws.region: !Ref 'AWS::Region'
+        FlinkApplicationConfiguration:
+          ParallelismConfiguration:
+            ConfigurationType: CUSTOM
+            Parallelism: 2
+            ParallelismPerKPU: 1
+            AutoScalingEnabled: true
+          MonitoringConfiguration:
+            ConfigurationType: CUSTOM
+            LogLevel: INFO
+            MetricsLevel: APPLICATION
+
+  FlinkApplicationLogging:
+    Type: AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption
+    Properties:
+      ApplicationName: !Ref FlinkApplication
+      CloudWatchLoggingOption:
+        LogStreamARN: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${FlinkLogGroup}:log-stream:${FlinkLogStream}'
+
+Conditions:
+  CreateInputStream: !Equals [!Ref CreateInputStream, 'true']
+  CreateLogGroupKmsKey: !Equals [!Ref LogGroupKmsKeyArn, '']
+
+Outputs:
+  ApplicationName:
+    Description: Name of the deployed Managed Service for Apache Flink application
+    Value: !Ref FlinkApplication
+
+  InputKinesisStreamArn:
+    Description: ARN of the input (source) Kinesis Data Stream in use (created or existing)
+    Value: !Sub 'arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${InputStreamName}'
+
+  OutputKinesisStreamArn:
+    Description: ARN of the output (multiplied sink) Kinesis Data Stream
+    Value: !GetAtt OutputKinesisStream.Arn
+
+  ProducerLambdaName:
+    Condition: CreateInputStream
+    Description: Name of the sample producer Lambda (invoke it to push records into the input stream)
+    Value: !Ref ProducerLambda
+
+  ApplicationRoleArn:
+    Description: ARN of the IAM role used by the Flink application
+    Value: !GetAtt FlinkApplicationRole.Arn
