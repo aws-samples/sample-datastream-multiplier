@@ -1,4 +1,4 @@
-# Multiply pre-recorded data streams into production-scale test data with Amazon Managed Service for Apache Flink
+# Multiply pre-recorded streams with Amazon Managed Service for Apache Flink
 
 Companion code for the AWS Big Data Blog post of the same name.
 
