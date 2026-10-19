@@ -74,8 +74,11 @@ Parameters:
     Type: Number
     Default: 10
     MinValue: 1
+    MaxValue: 500
     Description: >
       Number of records the sample producer Lambda emits per invocation.
+      Capped at 500, the Kinesis PutRecords per-call limit; the Lambda also
+      batches defensively in case of a direct invocation override.
       Only used when CreateInputStream is 'true'.
 
   OutputShardCount:
@@ -120,17 +123,35 @@ Parameters:
     Default: 1000
     Description: Records-per-second rate limit (used by the optional DataGen source path).
 
-  LogGroupKmsKeyArn:
+  EncryptionKmsKeyArn:
     Type: String
     Default: ''
-    Description: (Optional) ARN of the KMS key for CloudWatch Logs encryption. If empty, a KMS key will be created.
+    Description: >-
+      (Optional) ARN of the KMS key used across this stack's resources that
+      need encryption (CloudWatch Logs, the producer Lambda's environment
+      variables). If empty, a KMS key will be created.
+
+  CreateAccessAnalyzer:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Whether this stack creates an account-level IAM Access Analyzer. Default
+      'false': an ACCOUNT-type analyzer is account-scoped security infrastructure,
+      not a dependency of this application's data path, and most accounts
+      already have one managed centrally. Creating a second one here can
+      conflict with (or mask) that central analyzer. Only set 'true' if you
+      know this account has none and you want this stack to own it.
 
 Resources:
   # -------------------------------------------------------
-  # IAM Access Analyzer
+  # IAM Access Analyzer (optional, off by default - see CreateAccessAnalyzer)
   # -------------------------------------------------------
   AccessAnalyzer:
     Type: AWS::AccessAnalyzer::Analyzer
+    Condition: CreateAccessAnalyzer
     Properties:
       AnalyzerName: !Sub '${ApplicationName}-analyzer'
       Type: ACCOUNT
@@ -195,14 +216,38 @@ Resources:
                   - xray:PutTelemetryRecords
                 Resource: '*'
 
+  # Explicit log group for the producer Lambda. Without this, CloudFormation
+  # grants the Lambda logs:CreateLogGroup but never creates or owns the group
+  # itself, so it is auto-created on first invocation with no retention
+  # policy and no customer-managed KMS key, and is left behind when the
+  # stack is deleted.
+  ProducerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateInputStream
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ApplicationName}-producer'
+      RetentionInDays: 7
+      KmsKeyId: !If
+        - CreateEncryptionKmsKey
+        - !GetAtt EncryptionKmsKey.Arn
+        - !Ref EncryptionKmsKeyArn
+
   ProducerLambda:
     Type: AWS::Lambda::Function
     Condition: CreateInputStream
+    DependsOn: ProducerLambdaLogGroup
     # No DeadLetterConfig by design. This helper Lambda is invoked synchronously,
     # on demand, to seed the input stream with a small batch of sample records. It
     # is not part of the multiplier data path and has no asynchronous invoker, so a
     # dead letter queue would never receive anything. Failures surface in the
     # caller's response and in the function's CloudWatch logs.
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_116
+            comment: Invoked synchronously on demand with no asynchronous invoker, so a DLQ would never receive events.
+          - id: CKV_AWS_117
+            comment: Sample-data helper that only calls the public Kinesis API; a VPC adds subnets and endpoints with no security benefit here.
     # kics-scan ignore-block
     Properties:
       FunctionName: !Sub '${ApplicationName}-producer'
@@ -220,11 +265,24 @@ Resources:
           Value: !Ref ApplicationName
         - Key: Component
           Value: sample-data-producer
+      # Lambda always encrypts environment variables at rest; without KmsKeyArn
+      # it uses an AWS managed key. Pointing at this stack's own KMS key (the
+      # same one used for CloudWatch Logs encryption) gives a customer managed
+      # key instead, for consistent key management, rotation, and audit
+      # visibility across the stack - matching AWS's own guidance to prefer a
+      # customer managed key over the account default.
+      KmsKeyArn: !If
+        - CreateEncryptionKmsKey
+        - !GetAtt EncryptionKmsKey.Arn
+        - !Ref EncryptionKmsKeyArn
       Environment:
         Variables:
           STREAM_NAME: !Ref InputStreamName
           NUM_RECORDS: !Ref ProducerNumRecords
       Code:
+        # Kept in sync with infrastructure/lambda/producer.py by hand: CloudFormation's
+        # ZipFile property must be inlined and cannot reference an external file.
+        # If you change one, change the other.
         ZipFile: |
           import json
           import os
@@ -237,6 +295,20 @@ Resources:
 
           STREAM_NAME = os.environ.get("STREAM_NAME", "sample_replay_input_stream")
           NUM_RECORDS = int(os.environ.get("NUM_RECORDS", "10"))
+
+          # Kinesis PutRecords hard limits: at most 500 records, and at most 5 MiB
+          # total, per call. NUM_RECORDS is validated at deploy time (CFN MaxValue)
+          # to stay at or below this, but batching defensively here means the
+          # Lambda still behaves correctly if invoked directly with a larger
+          # NUM_RECORDS override.
+          KINESIS_PUT_RECORDS_MAX_BATCH = 500
+
+          # Bounded retry for partial failures: a 200 response from
+          # put_records can still contain individual failed records (e.g.
+          # throttling), which are retried here rather than reported as if
+          # the whole batch succeeded.
+          MAX_RETRIES = 3
+          INITIAL_BACKOFF_SECONDS = 0.5
 
           FROM_LOCATIONS = ["Manhattan", "Brooklyn", "Queens", "Bronx", "StatenIsland"]
           TO_LOCATIONS = ["JFK", "LaGuardia", "Newark", "TimesSquare", "CentralPark"]
@@ -266,6 +338,42 @@ Resources:
               }
 
 
+          def _chunk(items, size):
+              for i in range(0, len(items), size):
+                  yield items[i : i + size]
+
+
+          def put_records_with_retry(stream_name, records):
+              """
+              Sends `records` via PutRecords, retrying only the entries that
+              failed, with bounded exponential backoff. Returns the count of
+              records that remain unwritten after MAX_RETRIES attempts.
+              """
+              pending = list(records)
+              backoff = INITIAL_BACKOFF_SECONDS
+
+              for attempt in range(1, MAX_RETRIES + 1):
+                  response = kinesis.put_records(StreamName=stream_name, Records=pending)
+                  failed_count = response.get("FailedRecordCount", 0)
+
+                  if failed_count == 0:
+                      return 0
+
+                  pending = [
+                      record
+                      for record, result in zip(pending, response["Records"])
+                      if "ErrorCode" in result
+                  ]
+
+                  if attempt == MAX_RETRIES:
+                      break
+
+                  time.sleep(backoff)
+                  backoff *= 2
+
+              return len(pending)
+
+
           def lambda_handler(event, context):
               records = []
               for i in range(NUM_RECORDS):
@@ -278,15 +386,31 @@ Resources:
                       }
                   )
 
-              response = kinesis.put_records(StreamName=STREAM_NAME, Records=records)
+              total_failed = 0
+              for batch in _chunk(records, KINESIS_PUT_RECORDS_MAX_BATCH):
+                  total_failed += put_records_with_retry(STREAM_NAME, batch)
 
-              failed = response.get("FailedRecordCount", 0)
               result = {
                   "stream": STREAM_NAME,
                   "requested": NUM_RECORDS,
-                  "failed": failed,
-                  "sample": records[0]["Data"].decode("utf-8"),
+                  "failed": total_failed,
+                  # records[0] is accessed unconditionally only when there is a
+                  # records[0]: a direct invocation can override NUM_RECORDS to
+                  # 0, in which case `records` is empty and there is no sample
+                  # to report.
+                  "sample": records[0]["Data"].decode("utf-8") if records else None,
               }
+
+              if total_failed > 0:
+                  # Surface a terminal failure instead of returning HTTP 200
+                  # with unwritten records: callers should not mistake this
+                  # response for complete test-data creation.
+                  print(json.dumps(result))
+                  raise RuntimeError(
+                      f"{total_failed} of {NUM_RECORDS} record(s) could not be written to "
+                      f"'{STREAM_NAME}' after {MAX_RETRIES} attempt(s)."
+                  )
+
               print(json.dumps(result))
               return result
   # -------------------------------------------------------
@@ -395,13 +519,15 @@ Resources:
                 cloudwatch:namespace: 'AWS/KinesisAnalytics'
 
   # -------------------------------------------------------
-  # KMS Key for CloudWatch Logs encryption
+  # Shared KMS key for this stack's encryption needs: CloudWatch Logs (the
+  # Flink application and producer Lambda log groups) and the producer
+  # Lambda's environment variables.
   # -------------------------------------------------------
-  LogGroupKmsKey:
+  EncryptionKmsKey:
     Type: AWS::KMS::Key
-    Condition: CreateLogGroupKmsKey
+    Condition: CreateEncryptionKmsKey
     Properties:
-      Description: !Sub 'KMS key for ${ApplicationName} CloudWatch Logs encryption'
+      Description: !Sub 'KMS key for ${ApplicationName} CloudWatch Logs and Lambda environment variable encryption'
       EnableKeyRotation: true
       KeyPolicy:
         Version: '2012-10-17'
@@ -426,6 +552,33 @@ Resources:
               - kms:ScheduleKeyDeletion
               - kms:CancelKeyDeletion
             Resource: '*'
+          # Configuring a customer managed key on a Lambda function (CreateFunction /
+          # UpdateFunctionConfiguration with KmsKeyArn set) is performed with the
+          # permissions of the IAM principal making that API call - e.g. whoever
+          # runs `aws cloudformation deploy` - not the function's execution role.
+          # Per AWS's own docs ("Managing permissions to your server-side
+          # encryption KMS key"): "Lambda uses your [the caller's] permissions to
+          # create a grant on the key. This allows Lambda to use it for
+          # encryption," requiring kms:CreateGrant and kms:Encrypt on the caller,
+          # plus kms:Decrypt to view/manage the configured variables later.
+          # AllowKeyAdministration above does not include these, so even an
+          # account-root-derived admin identity was blocked by this key's
+          # resource policy (identity policies alone are not sufficient for KMS;
+          # see the key policy requirement at the top of this key's Properties).
+          # Granting the account root here, rather than naming ProducerLambdaRole
+          # specifically, is what lets whichever IAM principal performs the
+          # deploy (not persisted into the stack, so it can't be scoped the way
+          # ProducerLambdaRole's own grant is) complete that step.
+          - Sid: AllowAccountToConfigureLambdaEncryption
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:CreateGrant
+            Resource: '*'
           - Sid: AllowCloudWatchLogs
             Effect: Allow
             Principal:
@@ -439,7 +592,57 @@ Resources:
             Resource: '*'
             Condition:
               ArnLike:
-                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesis-analytics/${ApplicationName}'
+                # Covers both log groups this stack may create with this key:
+                # the Flink application log group and the producer Lambda's
+                # log group.
+                kms:EncryptionContext:aws:logs:arn:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesis-analytics/${ApplicationName}'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationName}-producer'
+          # Lambda environment variable encryption with this customer managed
+          # key (ProducerLambda.KmsKeyArn) instead of the AWS managed default.
+          # Lambda decrypts env vars using the function's own execution role,
+          # and needs permission to create a grant on the key for that role
+          # (the mechanism it uses to get decrypt access without the key
+          # policy naming the Lambda service principal directly).
+          #
+          # ProducerLambdaRole only exists when CreateInputStream is 'true'
+          # (same condition as ProducerLambda itself); this KMS key has no
+          # such condition, so these two statements are each wrapped in Fn::If
+          # and resolve to AWS::NoValue (dropped from the Statement list) when
+          # CreateInputStream is 'false', rather than referencing a role that
+          # was never created.
+          - !If
+            - CreateInputStream
+            - Sid: AllowProducerLambdaEnvVarEncryption
+              Effect: Allow
+              Principal:
+                AWS: !GetAtt ProducerLambdaRole.Arn
+              Action:
+                # kms:Encrypt is required at function create/update time, when
+                # Lambda encrypts the environment variables with this key.
+                # kms:Decrypt/GenerateDataKey are required at invoke time, to
+                # decrypt them back into the running function's environment.
+                # Missing kms:Encrypt here caused CREATE_FAILED with
+                # "Lambda was unable to encrypt your environment variables...
+                # KMS Exception: AccessDeniedException" on kms:Encrypt.
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: '*'
+            - !Ref 'AWS::NoValue'
+          - !If
+            - CreateInputStream
+            - Sid: AllowProducerLambdaToCreateGrant
+              Effect: Allow
+              Principal:
+                AWS: !GetAtt ProducerLambdaRole.Arn
+              Action:
+                - kms:CreateGrant
+              Resource: '*'
+              Condition:
+                Bool:
+                  kms:GrantIsForAWSResource: true
+            - !Ref 'AWS::NoValue'
 
   # -------------------------------------------------------
   # CloudWatch Log Group
@@ -450,9 +653,9 @@ Resources:
       LogGroupName: !Sub '/aws/kinesis-analytics/${ApplicationName}'
       RetentionInDays: 7
       KmsKeyId: !If
-        - CreateLogGroupKmsKey
-        - !GetAtt LogGroupKmsKey.Arn
-        - !Ref LogGroupKmsKeyArn
+        - CreateEncryptionKmsKey
+        - !GetAtt EncryptionKmsKey.Arn
+        - !Ref EncryptionKmsKeyArn
 
   FlinkLogStream:
     Type: AWS::Logs::LogStream
@@ -517,7 +720,8 @@ Resources:
 
 Conditions:
   CreateInputStream: !Equals [!Ref CreateInputStream, 'true']
-  CreateLogGroupKmsKey: !Equals [!Ref LogGroupKmsKeyArn, '']
+  CreateEncryptionKmsKey: !Equals [!Ref EncryptionKmsKeyArn, '']
+  CreateAccessAnalyzer: !Equals [!Ref CreateAccessAnalyzer, 'true']
 
 Outputs:
   ApplicationName:

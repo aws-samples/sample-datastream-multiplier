@@ -1,0 +1,13 @@
+# Dependencies for running infrastructure/lambda/test_producer.py locally.
+#
+# boto3 is only needed so the test environment matches the Lambda runtime
+# (which bundles boto3 by default) - test_producer.py itself mocks the
+# Kinesis client via unittest.mock, it never makes a real AWS call.
+# unittest and unittest.mock are standard library; no test runner dependency
+# (pytest, moto, etc.) is required.
+#
+# Floor version, not an exact pin: this is a test-only dependency whose only
+# requirement is a stable put_records()/PutRecords response shape, which has
+# not changed across boto3 releases. 1.42.97 is the version this test suite
+# was last verified against.
+boto3>=1.42.97

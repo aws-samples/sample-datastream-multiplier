@@ -1,13 +1,13 @@
 
 package com.amazonaws.services.msf.process
 
+import com.amazonaws.services.msf.RuntimeConfig
 import com.amazonaws.services.msf.model.{NYCTrip, FakerConfigLoader, SeededDataFaker}
 import org.apache.flink.api.common.functions.{OpenContext, RichFlatMapFunction}
 import org.apache.flink.util.Collector
 import org.slf4j.{Logger, LoggerFactory}
 
 import java.util.Properties
-import scala.util.Try
 
 trait CustomRichFlatMapMultiplier[IN, OUT] extends RichFlatMapFunction[IN, OUT] {
 
@@ -36,17 +36,27 @@ class StreamMultiplier(fakerConfig: String, properties: Properties)
 
   private val logger: Logger = LoggerFactory.getLogger(getClass)
 
-  // Secondary constructor for backward compatibility
+  // Secondary constructor for backward compatibility. Defaults mirror
+  // RuntimeConfig's own defaults, as there is no "multipliedStream" property
+  // group to validate when constructed this way.
   def this() = this("", new Properties())
 
   // Mark as transient to avoid serialization issues
   @transient private var configLoader: FakerConfigLoader = _
   @transient private var faker: SeededDataFaker = _
 
-  override val keyFields: Set[String] = properties.get("key.fields").toString.split(",").map(_.trim).toSet
-  override val multiplier: Int = properties.get("multiple.factor").toString.toInt
-  override val randomSeedInitializers: List[Long] = properties.get("random.seeds").toString.split(",").map(_.trim.toLong).toList
-  private val updatableFields: Set[String] = properties.get("updatable.fields").toString.split(",").map(_.trim).toSet
+  // Delegates to RuntimeConfig for validation instead of re-parsing
+  // key.fields/multiple.factor/random.seeds/updatable.fields independently.
+  // An empty Properties (no-arg constructor) is treated as "nothing
+  // configured yet" rather than re-validated, since RuntimeConfig requires a
+  // seed/key field to be present.
+  private val validated: Option[RuntimeConfig.Validated] =
+    if (properties.isEmpty) None else Some(RuntimeConfig.validate(properties))
+
+  override val keyFields: Set[String] = validated.map(_.keyFields).getOrElse(Set.empty)
+  override val multiplier: Int = validated.map(_.multiplier).getOrElse(1)
+  override val randomSeedInitializers: List[Long] = validated.map(_.randomSeeds).getOrElse(List.empty)
+  private val updatableFields: Set[String] = validated.map(_.updatableFields).getOrElse(Set.empty)
 
   // Memory monitoring
   private var processedCount: Long = 0
@@ -86,30 +96,30 @@ class StreamMultiplier(fakerConfig: String, properties: Properties)
   }
 
   override protected def emitMultipliedEvent(event: NYCTrip, out: Collector[NYCTrip], counter: Int): Unit = {
-    try {
-      val eventHash = computeEventHash(event, keyFields, randomSeedInitializers, counter)
+    // No try/catch here: a catch that only rethrows the same exception is a
+    // no-op that implies error handling where there is none. Flink already
+    // surfaces an unhandled exception from flatMap as a task failure with its
+    // full stack trace in the job's logs, so there is nothing this call site
+    // would add by catching and immediately rethrowing.
+    val eventHash = computeEventHash(event, keyFields, randomSeedInitializers, counter)
 
-      // Pass the reusable instances - NO NEW OBJECTS CREATED
-      val multipliedEvent = NYCTrip.randomizeFields(
-        event,
-        eventHash,
-        updatableFields,
-        configLoader,  // Reuse singleton instance
-        faker          // Reuse singleton instance (will be reseeded)
-      )
-      out.collect(multipliedEvent)
+    // Pass the reusable instances - NO NEW OBJECTS CREATED
+    val multipliedEvent = NYCTrip.randomizeFields(
+      event,
+      eventHash,
+      updatableFields,
+      configLoader,  // Reuse singleton instance
+      faker          // Reuse singleton instance (will be reseeded)
+    )
+    out.collect(multipliedEvent)
 
-      // Memory monitoring
-      processedCount += 1
-      if (processedCount % MEMORY_LOG_INTERVAL == 0) {
-        val runtime = Runtime.getRuntime
-        val usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / 1024 / 1024
-        val maxMemory = runtime.maxMemory() / 1024 / 1024
-        logger.info(s"Processed $processedCount events. Memory: ${usedMemory}MB / ${maxMemory}MB")
-      }
-
-    } catch {
-      case ex: Exception => throw ex
+    // Memory monitoring
+    processedCount += 1
+    if (processedCount % MEMORY_LOG_INTERVAL == 0) {
+      val runtime = Runtime.getRuntime
+      val usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / 1024 / 1024
+      val maxMemory = runtime.maxMemory() / 1024 / 1024
+      logger.info(s"Processed $processedCount events. Memory: ${usedMemory}MB / ${maxMemory}MB")
     }
   }
 
@@ -117,7 +127,15 @@ class StreamMultiplier(fakerConfig: String, properties: Properties)
                                keyFields: Set[String],
                                randomSeedInitializers: List[Long],
                                counter: Int): Long = {
-    val baseHash = randomSeedInitializers.lift(counter - 1).getOrElse(0L)
+    // Every copy index contributes its own entropy via `counter`, on top of
+    // whichever user-supplied seed is available (cycling through the
+    // configured list once it is exhausted, rather than falling back to a
+    // constant). This guarantees distinct copies never collapse onto the
+    // same hash purely because the seed list ran out.
+    val configuredSeed =
+      if (randomSeedInitializers.isEmpty) 0L
+      else randomSeedInitializers((counter - 1) % randomSeedInitializers.size)
+    val baseHash = configuredSeed + (counter.toLong * 0x9E3779B97F4A7C15L)
 
     var fieldHashSum = 0L
 
