@@ -36,6 +36,54 @@ You also need JDK 17, which is the default Java version for Flink 2.x.
 > (`6.0.1-2.0`), which provides both the `KinesisStreamsSource` and `KinesisStreamsSink`.
 > The legacy `flink-connector-kinesis` artifact is not used on Flink 2.x.
 
+> If you package this repository itself for distribution (e.g. a source zip, separate from the
+> `sbt assembly` jar above), exclude VCS and OS metadata explicitly — a plain `zip -r` or the
+> macOS Finder "Compress" action includes them by default:
+> ```bash
+> zip -r datastreammultiplier.zip . -x ".git/*" ".DS_Store" "*/.DS_Store" "__MACOSX/*" "target/*"
+> ```
+
+### Running tests
+
+#### Scala (Flink job)
+
+Unit tests cover `RuntimeConfig` validation, `StreamMultiplier` cardinality/uniqueness,
+`NYCTrip`'s Flink POJO contract, and the JSON (de)serializers. They use
+[ScalaTest](https://www.scalatest.org/) plus Flink's `flink-test-utils` for operator-level tests,
+both declared as `Test`-scoped dependencies in `build.sbt` — no separate setup is required beyond
+`sbt` and JDK 17 (see Pre-requisites above).
+
+```bash
+sbt test
+```
+
+To run a single suite:
+
+```bash
+sbt "testOnly com.amazonaws.services.msf.process.StreamMultiplierSpec"
+```
+
+#### Python (producer Lambda)
+
+`infrastructure/lambda/test_producer.py` covers batching above the Kinesis `PutRecords` limit and
+retry of partially failed writes. It uses only the standard library (`unittest` /
+`unittest.mock`), so no test runner (pytest, moto, etc.) is required — `boto3` is the only
+dependency, needed so the test environment matches what the Lambda runtime provides.
+
+```bash
+# From infrastructure/lambda/
+pip3 install -r requirements.txt
+python3 -m unittest test_producer -v
+```
+
+The tests mock the Kinesis client, so they do not need AWS credentials. If you see
+`NoRegionError` when running them, set a region first (any value works, since no real call is
+made):
+
+```bash
+export AWS_DEFAULT_REGION=us-west-2
+```
+
 ### Deploying with CloudFormation
 
 `infrastructure/cfn-template.yaml` provisions the full stack on Amazon Managed Service for
@@ -62,13 +110,14 @@ Apache Flink. It creates:
 | `CreateInputStream` | `true` | Create the input stream (and the producer Lambda). Set `false` to reuse an existing stream named by `InputStreamName`. |
 | `InputStreamName` | `sample_replay_input_stream` | Input stream to create, or the existing stream to read from. |
 | `OutputStreamName` | `sample_replay_output_stream` | Output (multiplied) stream to create. |
-| `InputShardCount` / `OutputShardCount` | `2` / `4` | Shard counts for the streams. |
+| `InputShardCount` / `OutputShardCount` | `1` / `2` | Shard counts for the streams. Output defaults higher than input to absorb the multiplier. |
 | `SourceType` | `kinesis` | `kinesis` to replay a pre-recorded stream, `datagen` to generate synthetic records in-application. |
-| `StreamRetentionHours` | `168` | Retention for both streams. 24 is the default tier; 25-168 is extended retention billed per shard-hour; above 168 is long-term retention billed per GB-month. |
+| `StreamRetentionHours` | `168` (7 days) | Retention for both streams. 24h is the standard tier at no extra cost; this default opts into 7-day extended retention, billed per shard-hour — see `MinValue`/`MaxValue` in the template if you want to lower it to 24. |
 | `MultipleFactor` | `10` | Copies emitted per input record (1-100). |
-| `KeyFields` / `RandomSeeds` / `UpdatableFields` | see template | Multiplier randomization config. |
-| `ProducerNumRecords` | `10` | Records the producer Lambda emits per invocation. |
-| `LogGroupKmsKeyArn` | _(empty)_ | Optional KMS key for log encryption; a key is created if empty. |
+| `KeyFields` / `RandomSeeds` / `UpdatableFields` | see template | Multiplier randomization config. Provide at least `MultipleFactor - 1` random seeds so every copy gets its own configured seed (see Runtime configuration below). |
+| `ProducerNumRecords` | `10` | Records the producer Lambda emits per invocation. Capped at 500 (the Kinesis `PutRecords` per-call limit). |
+| `EncryptionKmsKeyArn` | _(empty)_ | Optional KMS key for log and producer Lambda environment variable encryption; a key is created if empty. |
+| `CreateAccessAnalyzer` | `false` | Whether this stack creates an account-level IAM Access Analyzer. Off by default since it's account-scoped infrastructure, not part of this app's data path, and can conflict with a centrally managed analyzer. |
 
 > `CreateInputStream` controls both the input stream **and** the producer Lambda. When `true`,
 > the stack owns the input stream and deploys the producer to feed it. When `false`, it reuses
@@ -121,6 +170,13 @@ by default — there is no schedule or automatic trigger. Options to run it auto
 an EventBridge scheduled rule (for a continuous feed) or a CloudFormation custom resource (to seed
 once at deploy time); neither is wired in currently.
 
+> **`tripId` is not unique across invocations.** The producer assigns `tripId` from its loop
+> index (`0..ProducerNumRecords-1`) and restarts at 0 every invocation, so the same `tripId` /
+> partition key values are reused across runs. This is intentional for a sample producer whose
+> only job is to put a few records on the stream for a smoke test — it is not meant to model
+> unique business keys. If you invoke it repeatedly and need unique IDs (e.g. to test downstream
+> deduplication), generate `tripId` from a UUID or a timestamp-based counter instead.
+
 ### Runtime configuration
 
 The application reads the runtime configuration from the Runtime Properties, when running on Amazon Managed Service for
@@ -128,15 +184,30 @@ Apache Flink.
 
 The following runtime properties are required:
 
-| Group ID        | Key           | Description                                   |
-|-----------------|---------------|-----------------------------------------------|
-| `InputStream0`  | `stream.name` | Name of the input stream                      |
-| `InputStream0`  | `aws.region`  | Region of the input stream, e.g. `us-west-2`  |
-| `OutputStream0` | `stream.name` | Name of the output stream                     |
-| `OutputStream0` | `aws.region`  | Region of the output stream, e.g. `us-west-2` |
+| Group ID        | Key          | Description                                                                           |
+|-----------------|--------------|----------------------------------------------------------------------------------------|
+| `InputStream0`  | `stream.arn` | ARN of the input stream, e.g. `arn:aws:kinesis:us-west-2:123456789012:stream/my-input` |
+| `InputStream0`  | `aws.region` | Region of the input stream, e.g. `us-west-2`                                           |
+| `OutputStream0` | `stream.arn` | ARN of the output stream, e.g. `arn:aws:kinesis:us-west-2:123456789012:stream/my-output`|
+| `OutputStream0` | `aws.region` | Region of the output stream, e.g. `us-west-2`                                          |
+
+> `DataMultiplierJob` reads `stream.arn` via `inputProperties.getProperty("stream.arn", default)`.
+> If this key is missing or misnamed (e.g. `stream.name`), the job silently falls back to the
+> hard-coded sample ARN (`.../stream/sample_replay_input_stream` or
+> `.../stream/sample_replay_output_stream`) instead of failing fast, so double-check the key name.
 
 - A separate configuration block to set the multiplier input parameters, such as multiply factor, stream key fields etc.
   - The `multiple.factor` parameter has an upper bound, should be a valid integer between 1 and 100
+  - `random.seeds` should ideally provide at least `multiple.factor - 1` seeds so every multiplied
+    copy gets its own configured seed. Fewer seeds than that causes seeds to be reused across
+    copies; the per-copy index is still mixed into the hash so this does not reintroduce
+    guaranteed duplicate output, but it does reduce randomization entropy. Note that even with
+    fully distinct seeds, a finite faker domain (e.g. `category` only has 3 possible values) can
+    still produce the same value by chance — distinct seeds do not guarantee distinct output.
+  - All of `multiple.factor`, `key.fields`, `random.seeds`, `updatable.fields`,
+    `rate.limit.per.second`, and `source.type` are validated together at startup
+    (`RuntimeConfig.scala`); an invalid value in any of them fails the job with one consolidated
+    error listing every problem found, rather than failing on the first one.
 
 ### Running in IntelliJ
 
@@ -235,13 +306,18 @@ VARCHAR category
 ```
   SECURITY WARNING: This is a demo deserializer without production-grade validation.
 
-  Before using in production, implement the following:
+  Already implemented (see JsonDeserializationSchema.scala):
+    - Input size limit: whole message capped at 100 KB (MaxInputSize), rejected before parsing
+    - Bounds checking for numeric fields: tripId >= 0, timestamp > 0, 0 <= distance <= 10000,
+      0 <= amount <= 100000
+    - Non-empty checks on fromLocationName, toLocationName, category
+
+  Still missing before production use:
 
   CODE-LEVEL SECURITY:
-    - Input size limits (e.g., 100KB max)
-    - Field length validation (e.g., 256 chars per field)
-    - Bounds checking for numeric conversions
-    - Stricter regex patterns with bounded field lengths and allowed character sets
+    - Field length validation (e.g., 256 chars per field) - string fields have no upper bound today
+    - Stricter regex / allowed-character-set validation on string fields (fromLocationName,
+      toLocationName, category are currently accepted as any non-empty string)
 
   OPERATIONAL SECURITY:
     - Dependency Scanning: Implement automated vulnerability scanning for dependencies
@@ -279,7 +355,8 @@ aws cloudformation wait stack-delete-complete --stack-name data-stream-multiplie
 ```
 
 That removes the Flink application, both Kinesis Data Streams, the producer Lambda, the IAM role
-and policy, the log group, and the KMS key created for log encryption.
+and policy, the log group, and the KMS key created for log and Lambda environment variable
+encryption.
 
 Two things the stack does not remove:
 
@@ -293,7 +370,7 @@ Two things the stack does not remove:
 - **An input stream the stack does not own.** If you deployed with `CreateInputStream=false`, the
   input stream belongs to whoever created it and is left in place.
 
-If you passed your own key through `LogGroupKmsKeyArn`, that key is also left alone. A key the
+If you passed your own key through `EncryptionKmsKeyArn`, that key is also left alone. A key the
 stack created for you is scheduled for deletion when the stack is removed.
 
 ## Security
